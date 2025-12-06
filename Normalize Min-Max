@@ -1,0 +1,500 @@
+import numpy as np
+import pandas as pd
+from scipy.fft import fft
+from pathlib import Path
+import os
+import tkinter as tk
+from tkinter import filedialog
+from datetime import datetime
+
+
+# =============================================================================
+# NORMALIZATION FUNCTIONS
+# =============================================================================
+
+def calculate_magnitude(x, y, z):
+    """Calculate the magnitude of 3D vector."""
+    return np.sqrt(x ** 2 + y ** 2 + z ** 2)
+
+
+def z_score_normalize(values):
+    """Normalize to mean=0, std=1."""
+    mean = np.mean(values)
+    std = np.std(values)
+    if std == 0:
+        return values - mean
+    return (values - mean) / std
+
+
+def min_max_normalize(values, new_min=-1, new_max=1):
+    """Scale to fixed range (default: -1 to 1)."""
+    old_min = np.min(values)
+    old_max = np.max(values)
+
+    # --- [แก้ไข] ---
+    # ถ้าค่าสูงสุดเท่ากับต่ำสุด (เช่น ข้อมูลเป็น 0 ทั้งหมด หรือค่าคงที่)
+    # ให้คืนค่า 0 เพื่อป้องกันไม่ให้ข้อมูลที่อยู่นิ่งๆ ถูกดึงลงไปเป็น -1
+    if old_max == old_min:
+        return np.zeros_like(values, dtype=np.float64)
+    # ---------------
+
+    normalized = (values - old_min) / (old_max - old_min)
+    return normalized * (new_max - new_min) + new_min
+
+
+# =============================================================================
+# FEATURE EXTRACTION
+# =============================================================================
+
+def extract_statistical_features(values, prefix):
+    """Extract statistical features from time series."""
+    features = {}
+
+    features[f'{prefix}_mean'] = np.mean(values)
+    features[f'{prefix}_std'] = np.std(values)
+    features[f'{prefix}_min'] = np.min(values)
+    features[f'{prefix}_max'] = np.max(values)
+    features[f'{prefix}_range'] = features[f'{prefix}_max'] - features[f'{prefix}_min']
+    features[f'{prefix}_median'] = np.median(values)
+    features[f'{prefix}_rms'] = np.sqrt(np.mean(values ** 2))
+
+    # Changes
+    diff = np.diff(values)
+    features[f'{prefix}_mean_diff'] = np.mean(np.abs(diff)) if len(diff) > 0 else 0
+    features[f'{prefix}_max_diff'] = np.max(np.abs(diff)) if len(diff) > 0 else 0
+
+    return features
+
+
+def extract_frequency_features(values, sampling_rate, prefix):
+    """Extract frequency domain features."""
+    features = {}
+
+    fft_values = np.abs(fft(values))
+    fft_freq = np.fft.fftfreq(len(values), 1 / sampling_rate)
+
+    positive_idx = fft_freq > 0
+    fft_values = fft_values[positive_idx]
+    fft_freq = fft_freq[positive_idx]
+
+    if len(fft_values) > 0:
+        dominant_idx = np.argmax(fft_values)
+        features[f'{prefix}_dominant_freq'] = fft_freq[dominant_idx]
+        features[f'{prefix}_dominant_magnitude'] = fft_values[dominant_idx]
+        features[f'{prefix}_spectral_energy'] = np.sum(fft_values ** 2)
+    else:
+        features[f'{prefix}_dominant_freq'] = 0
+        features[f'{prefix}_dominant_magnitude'] = 0
+        features[f'{prefix}_spectral_energy'] = 0
+
+    return features
+
+
+def extract_window_features(acc_x, acc_y, acc_z,
+                            gyro_x, gyro_y, gyro_z,
+                            mag_x, mag_y, mag_z,
+                            sampling_rate=50):
+    """Extract all features from a window of multi-sensor data."""
+    all_features = {}
+
+    # Calculate magnitudes
+    acc_mag = calculate_magnitude(acc_x, acc_y, acc_z)
+    gyro_mag = calculate_magnitude(gyro_x, gyro_y, gyro_z)
+    mag_mag = calculate_magnitude(mag_x, mag_y, mag_z)
+
+    # Statistical features for each sensor
+    sensors = [
+        ('acc_x', acc_x), ('acc_y', acc_y), ('acc_z', acc_z), ('acc_mag', acc_mag),
+        ('gyro_x', gyro_x), ('gyro_y', gyro_y), ('gyro_z', gyro_z), ('gyro_mag', gyro_mag),
+        ('mag_x', mag_x), ('mag_y', mag_y), ('mag_z', mag_z), ('mag_mag', mag_mag)
+    ]
+
+    for name, values in sensors:
+        stat_features = extract_statistical_features(values, name)
+        all_features.update(stat_features)
+
+    # Frequency features for magnitudes
+    for name, values in [('acc_mag', acc_mag), ('gyro_mag', gyro_mag), ('mag_mag', mag_mag)]:
+        freq_features = extract_frequency_features(values, sampling_rate, name)
+        all_features.update(freq_features)
+
+    # Cross-axis correlations
+    if len(acc_x) > 1:
+        all_features['acc_corr_xy'] = np.corrcoef(acc_x, acc_y)[0, 1]
+        all_features['acc_corr_xz'] = np.corrcoef(acc_x, acc_z)[0, 1]
+        all_features['acc_corr_yz'] = np.corrcoef(acc_y, acc_z)[0, 1]
+        all_features['gyro_corr_xy'] = np.corrcoef(gyro_x, gyro_y)[0, 1]
+        all_features['gyro_corr_xz'] = np.corrcoef(gyro_x, gyro_z)[0, 1]
+        all_features['gyro_corr_yz'] = np.corrcoef(gyro_y, gyro_z)[0, 1]
+        all_features['mag_corr_xy'] = np.corrcoef(mag_x, mag_y)[0, 1]
+        all_features['mag_corr_xz'] = np.corrcoef(mag_x, mag_z)[0, 1]
+        all_features['mag_corr_yz'] = np.corrcoef(mag_y, mag_z)[0, 1]
+
+    return all_features
+
+
+# =============================================================================
+# DATA LOADING AND PREPROCESSING
+# =============================================================================
+
+def load_and_clean_data(file_path):
+    """Load CSV and clean data."""
+    print(f"\nLoading: {os.path.basename(file_path)}")
+
+    try:
+        data = pd.read_csv(file_path)
+        print(f"  Loaded {len(data)} rows")
+        print(f"  Columns: {data.columns.tolist()}")
+
+        # Find required columns
+        def find_col(names):
+            for name in names:
+                matches = [col for col in data.columns if col.upper() == name.upper()]
+                if matches:
+                    return matches[0]
+            return None
+
+        # Map columns
+        col_map = {
+            'ACC_X': find_col(['ACC_X', 'acc_x', 'AccX']),
+            'ACC_Y': find_col(['ACC_Y', 'acc_y', 'AccY']),
+            'ACC_Z': find_col(['ACC_Z', 'acc_z', 'AccZ']),
+            'GYRO_X': find_col(['GYRO_X', 'gyro_x', 'GyroX']),
+            'GYRO_Y': find_col(['GYRO_Y', 'gyro_y', 'GyroY']),
+            'GYRO_Z': find_col(['GYRO_Z', 'gyro_z', 'GyroZ']),
+            'MAG_X': find_col(['MAG_X', 'mag_x', 'MagX']),
+            'MAG_Y': find_col(['MAG_Y', 'mag_y', 'MagY']),
+            'MAG_Z': find_col(['MAG_Z', 'mag_z', 'MagZ']),
+            'Time': find_col(['Time', 'time', 'timestamp', 'Timestamp']),
+            'Activity': find_col(['Activity', 'activity', 'label', 'Label'])
+        }
+
+        # Check required columns
+        required = ['ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z',
+                    'MAG_X', 'MAG_Y', 'MAG_Z']
+        missing = [k for k in required if col_map[k] is None]
+
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+        # Convert to numeric and remove invalid rows
+        original_len = len(data)
+        for key in required:
+            col = col_map[key]
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+
+        # Remove rows with NaN in sensor data
+        sensor_cols = [col_map[k] for k in required]
+        data = data.dropna(subset=sensor_cols)
+
+        cleaned_len = len(data)
+        if cleaned_len < original_len:
+            print(f"  ⚠️  Removed {original_len - cleaned_len} invalid rows")
+
+        if cleaned_len == 0:
+            raise ValueError("No valid data after cleaning")
+
+        print(f"  ✓ Valid data: {cleaned_len} rows")
+
+        return data, col_map
+
+    except Exception as e:
+        raise Exception(f"Error loading file: {str(e)}")
+
+
+# =============================================================================
+# SLIDING WINDOW PROCESSING
+# =============================================================================
+
+def create_windows(data, col_map, window_size=100, step_size=50):
+    """Create sliding windows from data."""
+
+    required = ['ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z',
+                'MAG_X', 'MAG_Y', 'MAG_Z']
+
+    # Extract arrays
+    arrays = {k: data[col_map[k]].values for k in required}
+
+    # Activity label if exists
+    activity_col = col_map.get('Activity')
+    activities = data[activity_col].values if activity_col else None
+
+    windows = []
+    n_samples = len(data)
+
+    for start in range(0, n_samples - window_size + 1, step_size):
+        end = start + window_size
+
+        window = {
+            'acc_x': arrays['ACC_X'][start:end],
+            'acc_y': arrays['ACC_Y'][start:end],
+            'acc_z': arrays['ACC_Z'][start:end],
+            'gyro_x': arrays['GYRO_X'][start:end],
+            'gyro_y': arrays['GYRO_Y'][start:end],
+            'gyro_z': arrays['GYRO_Z'][start:end],
+            'mag_x': arrays['MAG_X'][start:end],
+            'mag_y': arrays['MAG_Y'][start:end],
+            'mag_z': arrays['MAG_Z'][start:end],
+            'start_idx': start,
+            'end_idx': end
+        }
+
+        # Most common activity in window
+        if activities is not None:
+            window_activities = activities[start:end]
+            unique, counts = np.unique(window_activities, return_counts=True)
+            if len(unique) > 0:
+                window['activity'] = unique[np.argmax(counts)]
+
+        windows.append(window)
+
+    return windows
+
+
+# =============================================================================
+# MAIN PROCESSING
+# =============================================================================
+
+def process_single_file(file_path, window_size=100, step_size=50,
+                        sampling_rate=50, normalize_method='z-score'):
+    """Process a single file."""
+
+    print(f"\n{'=' * 70}")
+    print(f"Processing: {os.path.basename(file_path)}")
+    print('=' * 70)
+
+    try:
+        # Load data
+        data, col_map = load_and_clean_data(file_path)
+
+        # Normalize each sensor axis
+        print("\nNormalizing sensor data...")
+        required = ['ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z',
+                    'MAG_X', 'MAG_Y', 'MAG_Z']
+
+        normalized_data = data.copy()
+
+        for key in required:
+            col = col_map[key]
+            values = data[col].values
+
+            if normalize_method == 'z-score':
+                normalized_data[col] = z_score_normalize(values)
+            else:
+                normalized_data[col] = min_max_normalize(values, -1, 1)
+
+        print(f"  ✓ Normalized {len(required)} sensor axes using {normalize_method}")
+
+        # Create raw normalized output
+        raw_output_cols = {}
+        for key in required:
+            new_name = key.lower()
+            raw_output_cols[new_name] = normalized_data[col_map[key]]
+
+        # Add time and activity if available
+        if col_map.get('Time'):
+            raw_output_cols['time'] = data[col_map['Time']]
+        if col_map.get('Activity'):
+            raw_output_cols['activity'] = data[col_map['Activity']]
+
+        raw_normalized_df = pd.DataFrame(raw_output_cols)
+
+        # Create windows
+        print(f"\nCreating sliding windows...")
+        print(f"  Window size: {window_size}, Step size: {step_size}")
+        windows = create_windows(normalized_data, col_map, window_size, step_size)
+        print(f"  ✓ Created {len(windows)} windows")
+
+        # Extract features
+        print("\nExtracting features from windows...")
+        feature_list = []
+
+        for i, window in enumerate(windows):
+            features = extract_window_features(
+                window['acc_x'], window['acc_y'], window['acc_z'],
+                window['gyro_x'], window['gyro_y'], window['gyro_z'],
+                window['mag_x'], window['mag_y'], window['mag_z'],
+                sampling_rate
+            )
+
+            features['window_start'] = window['start_idx']
+            features['window_end'] = window['end_idx']
+
+            if 'activity' in window:
+                features['activity'] = window['activity']
+
+            feature_list.append(features)
+
+            if (i + 1) % 100 == 0:
+                print(f"  Progress: {i + 1}/{len(windows)} windows...")
+
+        features_df = pd.DataFrame(feature_list)
+
+        print(f"\n✓ SUCCESS!")
+        print(f"  Raw normalized: {len(raw_normalized_df)} rows")
+        print(f"  Feature vectors: {len(features_df)} windows")
+        print(f"  Features per window: {len(features_df.columns)}")
+
+        return raw_normalized_df, features_df, True
+
+    except Exception as e:
+        print(f"\n✗ ERROR: {str(e)}")
+        return None, None, False
+
+
+def process_multiple_files(file_paths, output_dir=None, window_size=100,
+                           step_size=50, sampling_rate=50, normalize_method='z-score'):
+    """Process multiple files."""
+
+    if output_dir is None:
+        output_dir = os.path.dirname(file_paths[0]) if file_paths else '.'
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = Path(output_dir) / f"normalized_output_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 70}")
+    print(f"BATCH PROCESSING: {len(file_paths)} files")
+    print(f"Output: {output_dir}")
+    print('=' * 70)
+
+    results = []
+    success_count = 0
+
+    for i, file_path in enumerate(file_paths, 1):
+        print(f"\n[FILE {i}/{len(file_paths)}]")
+
+        raw_df, features_df, success = process_single_file(
+            file_path, window_size, step_size, sampling_rate, normalize_method
+        )
+
+        if success:
+            base_name = Path(file_path).stem
+
+            # Save raw normalized
+            raw_path = output_dir / f"{base_name}_raw_normalized.csv"
+            raw_df.to_csv(raw_path, index=False)
+
+            # Save features
+            features_path = output_dir / f"{base_name}_features.csv"
+            features_df.to_csv(features_path, index=False)
+
+            print(f"\n📁 Saved files:")
+            print(f"  - {raw_path.name}")
+            print(f"  - {features_path.name}")
+
+            results.append({
+                'filename': os.path.basename(file_path),
+                'raw_samples': len(raw_df),
+                'feature_windows': len(features_df),
+                'features_count': len(features_df.columns),
+                'status': 'Success'
+            })
+            success_count += 1
+        else:
+            results.append({
+                'filename': os.path.basename(file_path),
+                'status': 'Failed'
+            })
+
+    # Save summary
+    summary_df = pd.DataFrame(results)
+    summary_path = output_dir / "processing_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    print(f"\n{'=' * 70}")
+    print(f"BATCH PROCESSING COMPLETE")
+    print('=' * 70)
+    print(f"✓ Success: {success_count}/{len(file_paths)} files")
+    print(f"📂 Output directory: {output_dir}")
+    print(f"📋 Summary: {summary_path.name}")
+    print('=' * 70)
+
+    return summary_df, output_dir
+
+
+# =============================================================================
+# GUI AND MAIN
+# =============================================================================
+
+def select_files_gui():
+    """Open file dialog to select CSV files."""
+    root = tk.Tk()
+    root.withdraw()
+
+    file_paths = filedialog.askopenfilenames(
+        title="Select CSV files (ACC+GYRO+MAG data)",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+    )
+
+    root.destroy()
+    return list(file_paths)
+
+
+def main():
+    """Main function."""
+
+    print("=" * 70)
+    print("MULTI-SENSOR DATA NORMALIZER")
+    print("ACC + GYRO + MAG")
+    print("=" * 70)
+
+    # Select files
+    print("\n📂 Opening file selector...")
+    file_paths = select_files_gui()
+
+    if not file_paths:
+        print("❌ No files selected. Exiting.")
+        return
+
+    print(f"\n✓ Selected {len(file_paths)} file(s):")
+    for i, path in enumerate(file_paths, 1):
+        print(f"  {i}. {os.path.basename(path)}")
+
+    # Get settings
+    print(f"\n{'=' * 70}")
+    print("PROCESSING SETTINGS")
+    print('=' * 70)
+
+    try:
+        window_size = int(input("Window size [default=100]: ") or "100")
+        step_size = int(input("Step size [default=50]: ") or "50")
+        sampling_rate = int(input("Sampling rate (Hz) [default=50]: ") or "50")
+
+        print("\nNormalization method:")
+        print("  1. Z-Score (mean=0, std=1) [recommended]")
+        print("  2. Min-Max (-1 to 1)")
+        choice = input("Choose (1 or 2) [default=1]: ") or "1"
+        normalize_method = 'z-score' if choice == '1' else 'min-max'
+
+    except ValueError:
+        print("⚠️  Invalid input. Using defaults.")
+        window_size = 100
+        step_size = 50
+        sampling_rate = 50
+        normalize_method = 'z-score'
+
+    print(f"\n⚙️  Settings:")
+    print(f"  Window size: {window_size}")
+    print(f"  Step size: {step_size}")
+    print(f"  Sampling rate: {sampling_rate} Hz")
+    print(f"  Normalization: {normalize_method}")
+
+    # Process
+    summary, output_dir = process_multiple_files(
+        file_paths,
+        window_size=window_size,
+        step_size=step_size,
+        sampling_rate=sampling_rate,
+        normalize_method=normalize_method
+    )
+
+    # Display summary
+    print("\n📊 PROCESSING SUMMARY:")
+    print(summary.to_string(index=False))
+
+    input("\n✓ Done! Press Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
