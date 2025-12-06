@@ -1,0 +1,82 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+def normalize_inplace_baseline(df, cols):
+    """
+    แบบ In-place Baseline:
+    - แถวแรก: เซ็ตเป็น 0
+    - แถวถัดไป: new = current_raw - previous_new
+    - ใช้ previous เป็นค่าที่ถูกลบแล้ว
+    """
+
+    df_norm = df.copy()
+
+    # แปลงคอลัมน์เป็นตัวเลขก่อน
+    df_norm[cols] = df_norm[cols].apply(pd.to_numeric, errors="coerce")
+
+    # ประมวลผลแบบ update ค่าไปเรื่อยๆ
+    for col in cols:
+        df_norm.loc[0, col] = 0  # แถวแรก
+
+        for i in range(1, len(df_norm)):
+            prev = df_norm.loc[i - 1, col]      # previous = ค่าที่ถูก baseline แล้ว
+            current = df_norm.loc[i, col]       # current = ค่าดิบที่ถูกแปลงเป็น numeric แล้ว
+
+            # กรณี NaN ให้ถือว่า = 0
+            if pd.isna(prev):
+                prev = 0
+            if pd.isna(current):
+                current = 0
+
+            df_norm.loc[i, col] = current - prev
+
+    return df_norm
+
+
+def find_sensor_columns(df):
+    pref = ("ACC_", "GYRO_", "MAG_")
+    return [c for c in df.columns if c.startswith(pref)]
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+
+    file_paths = filedialog.askopenfilenames(
+        title="เลือกไฟล์ CSV",
+        filetypes=[("CSV Files", "*.csv")]
+    )
+
+    if not file_paths:
+        print("❌ ไม่ได้เลือกไฟล์")
+        return
+
+    for file_path in file_paths:
+        print(f"\n➡ ประมวลผล: {file_path}")
+
+        df = pd.read_csv(file_path)
+
+        sensor_cols = find_sensor_columns(df)
+        if not sensor_cols:
+            sensor_cols = df.select_dtypes(include=["number"]).columns.tolist()
+            print("⚠️ ไม่พบ ACC/GYRO/MAG → ใช้ numeric ทั้งหมด:", sensor_cols)
+
+        df_norm = normalize_inplace_baseline(df, sensor_cols)
+
+        folder = os.path.dirname(file_path)
+        base = os.path.basename(file_path)
+        name = os.path.splitext(base)[0]
+        output = os.path.join(folder, f"{name}_baseline.csv")
+
+        df_norm.to_csv(output, index=False)
+
+        print(f"✔ บันทึกไฟล์: {output}")
+        print(df_norm[sensor_cols].head())
+
+    print("\n🎉 เสร็จสมบูรณ์!")
+
+
+if __name__ == "__main__":
+    main()
