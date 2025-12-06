@@ -1,3 +1,5 @@
+# หมายเหตุ ควรติดตั้ง pip install pandas openpyxl scipy ใน terminal ก่อน
+
 import pandas as pd
 import os
 import tkinter as tk
@@ -137,4 +139,5 @@ if __name__ == "__main__":
     if file_path:
         process_sensor_file(file_path, experiment_title)
     else:
+
         print("❌ ไม่ได้เลือกไฟล์ โปรแกรมจบการทำงาน")
