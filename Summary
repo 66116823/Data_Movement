@@ -1,0 +1,111 @@
+import pandas as pd
+import os
+import tkinter as tk
+from tkinter import filedialog
+from openpyxl.styles import Font
+
+
+def get_experiment_info():
+    scenarios = [
+        "กรณีเดินปกติ",
+        "กรณีเดินปกติช้า",
+        "กรณีเดินเอียงขวา",
+        "กรณีเดินเอียงซ้าย",
+        "กรณีเดินเอียงซ้ายขวา",
+        "กรณีเดินหยุดชะงัก"
+    ]
+
+    print("\n" + "=" * 40)
+    print("   กรุณาเลือกสถานการณ์การทดลอง (Scenario)")
+    print("=" * 40)
+    for index, scenario in enumerate(scenarios, 1):
+        print(f" [{index}] {scenario}")
+    print("-" * 40)
+
+    while True:
+        choice = input("เลือกหมายเลข (1-6): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= 6:
+            selected_scenario = scenarios[int(choice) - 1]
+            break
+        else:
+            print("❌ กรุณาเลือกหมายเลข 1-6")
+
+    subject_name = input("กรุณาระบุชื่อผู้เข้าทดลอง: ").strip()
+    return f"{selected_scenario} : {subject_name}"
+
+
+def process_sensor_file(file_path, header_title):
+    print(f"\n📄 กำลังประมวลผลไฟล์: {file_path}")
+
+    df = pd.read_csv(file_path)
+
+    target_columns = [
+        'ACC_X', 'ACC_Y', 'ACC_Z',
+        'GYRO_X', 'GYRO_Y', 'GYRO_Z',
+        'MAG_X', 'MAG_Y', 'MAG_Z'
+    ]
+
+    valid_columns = [col for col in target_columns if col in df.columns]
+    if not valid_columns:
+        print("❌ ไม่พบคอลัมน์เซนเซอร์ที่ต้องการในไฟล์นี้")
+        return
+
+    # คำนวณค่าสถิติ
+    stats_data = {}
+    for col in valid_columns:
+        series = pd.to_numeric(df[col], errors='coerce')
+        stats_data[col] = {
+            'Mean': series.mean(),
+            'Median': series.median(),
+            'Skewness': series.skew(),
+            'Kurtosis': series.kurt(),
+            'Max': series.max(),
+            'Min': series.min()
+        }
+
+    summary_df = pd.DataFrame(stats_data)
+
+    # บันทึกไฟล์ Excel
+    output_filename = os.path.splitext(file_path)[0] + '_summary.xlsx'
+
+    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Raw Data', index=False)
+
+        summary_df.to_excel(writer, sheet_name='Summary Stats', startrow=2)
+
+        workbook = writer.book
+        worksheet = writer.sheets['Summary Stats']
+
+        worksheet['A1'] = "การทดลอง:"
+        worksheet['B1'] = header_title
+
+        bold = Font(bold=True, size=12)
+        worksheet['A1'].font = bold
+        worksheet['B1'].font = bold
+
+    print(f"✔ บันทึกไฟล์: {output_filename}")
+
+
+if __name__ == "__main__":
+    # รับ Scenario + ชื่อผู้ทดลอง
+    experiment_title = get_experiment_info()
+
+    # เปิดหน้าต่างเลือกหลายไฟล์
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+
+    print("\n⏳ กรุณาเลือกไฟล์ CSV หลายไฟล์ได้เลย...")
+
+    file_paths = filedialog.askopenfilenames(
+        title="เลือกไฟล์ CSV ข้อมูลเซนเซอร์",
+        filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+    )
+
+    if file_paths:
+        print(f"\n📦 จำนวนไฟล์ที่เลือก: {len(file_paths)} ไฟล์")
+        for file_path in file_paths:
+            process_sensor_file(file_path, experiment_title)
+        print("\n🎉 ประมวลผลทุกไฟล์เสร็จสมบูรณ์!")
+    else:
+        print("❌ ไม่ได้เลือกไฟล์ โปรแกรมจบการทำงาน")
