@@ -1,0 +1,95 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+BASELINE_SECONDS = 5.0
+
+def select_files():
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askopenfilenames(
+        title="Select CSV files",
+        filetypes=[("CSV Files", "*.csv")]
+    )
+
+def parse_time_custom(time_str: str) -> float:
+    try:
+        s = str(time_str).strip()
+        parts = s.split(":")
+
+        if len(parts) == 2:
+            mm = int(parts[0])
+            ss = float(parts[1])
+            return mm * 60 + ss
+        elif len(parts) == 3:
+            hh = int(parts[0])
+            mm = int(parts[1])
+            ss = float(parts[2])
+            return hh * 3600 + mm * 60 + ss
+        return None
+    except:
+        return None
+
+def process_file(file_path: str):
+    print(f"\nProcessing: {file_path}")
+
+    df = pd.read_csv(file_path, sep=",", engine="python")
+
+    if "Date" not in df.columns or "Time" not in df.columns:
+        print("❌ ไม่พบคอลัมน์ Date/Time")
+        print("Columns:", list(df.columns))
+        return
+
+    # แปลงเวลา
+    df["time_sec"] = df["Time"].apply(parse_time_custom)
+    df = df.dropna(subset=["time_sec"])
+
+    # elapsed
+    t0 = df["time_sec"].iloc[0]
+    df["elapsed"] = df["time_sec"] - t0
+
+    # sensor cols
+    sensor_cols = [c for c in df.columns
+                   if any(k in c.lower() for k in ["acc", "gyro"])]
+
+    if not sensor_cols:
+        print("❌ ไม่พบคอลัมน์ ACC/GYRO")
+        return
+
+    # แปลงเป็นตัวเลข
+    for c in sensor_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=sensor_cols)
+
+    # baseline
+    baseline_df = df[df["elapsed"] <= BASELINE_SECONDS]
+
+    if baseline_df.empty:
+        print("❌ ไม่พบข้อมูล baseline")
+        return
+
+    baseline = baseline_df[sensor_cols].mean()
+
+    # ลบ baseline
+    corrected_df = df.copy()
+    for col in sensor_cols:
+        corrected_df[col] = corrected_df[col] - baseline[col]
+
+    # ✅ ลบคอลัมน์ที่ไม่ต้องการก่อน save
+    drop_cols = [c for c in ["Heading_Deg", "Heading_Dir", "time_sec"]
+                 if c in corrected_df.columns]
+
+    corrected_df = corrected_df.drop(columns=drop_cols)
+
+    # save
+    out_path = os.path.splitext(file_path)[0] + "_BASELINE.csv"
+    corrected_df.to_csv(out_path, index=False)
+
+    print(f"✅ Saved: {out_path}")
+
+if __name__ == "__main__":
+    files = select_files()
+    for f in files:
+        process_file(f)
+    print("\n✅ Done")
