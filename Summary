@@ -57,6 +57,7 @@ def process_sensor_file(file_path, header_title):
         stats_data[col] = {
             'Mean': series.mean(),
             'Median': series.median(),
+            'SD': series.std(),
             'Skewness': series.skew(),
             'Kurtosis': series.kurt(),
             'Max': series.max(),
