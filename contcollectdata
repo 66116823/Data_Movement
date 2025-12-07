@@ -1,0 +1,702 @@
+import os
+import csv
+import time
+import math
+import queue
+import pytz
+import logging
+import threading
+import pandas as pd
+from datetime import datetime
+from collections import deque
+from flask import Flask, render_template, Response
+from flask_socketio import SocketIO
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import BlockingOSCUDPServer
+
+# -------------------- Logging --------------------
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# -------------------- Flask / SocketIO --------------------
+app = Flask(__name__)
+socketio = SocketIO(app)
+BANGKOK_TZ = pytz.timezone('Asia/Bangkok')
+
+# -------------------- OSC / Thresholds --------------------
+OSC_IP = "0.0.0.0"
+OSC_PORT = 12345
+ACC_THRESHOLD = 0.25
+GYRO_THRESHOLD = 0.1
+MAG_THRESHOLD = 1.0  # ดูฟังก์ชัน mag_ratio_crossed()
+RESET_TIMEOUT = 1.0
+
+# -------------------- Paths --------------------
+BASE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+WALK_DIR = os.path.join(BASE_DATA_DIR, "walk")
+BED_DIR = os.path.join(BASE_DATA_DIR, "bed to toilet")
+for directory in [BASE_DATA_DIR, WALK_DIR, BED_DIR]:
+    os.makedirs(directory, exist_ok=True)
+if not os.access(BASE_DATA_DIR, os.W_OK):
+    raise PermissionError(f"No write permission in {BASE_DATA_DIR}")
+
+# ---------- Encoding helper ----------
+def pick_file_encoding(path: str) -> str:
+    """ลองเดาตัวเข้ารหัสของไฟล์ CSV เพื่อหลีกเลี่ยง UnicodeDecodeError"""
+    candidates = ['utf-8-sig', 'utf-8', 'cp874', 'cp1252', 'latin1']
+    for enc in candidates:
+        try:
+            with open(path, 'r', encoding=enc, errors='strict') as f:
+                f.read(4096)  # ทดลองอ่าน
+            return enc
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+    return 'latin1'
+
+# -------------------- Runtime State --------------------
+data_dict = {
+    "ACC": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "GYRO": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "MAG": {"x": 0.0, "y": 0.0, "z": 0.0},
+}
+# NOTE: เราเก็บ dict baseline ไว้ได้ แต่จะไม่ใช้ตัดค่า ACC/GYRO อีกต่อไป
+baseline = {
+    "ACC": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "GYRO": {"x": 0.0, "y": 0.0, "z": 0.0},
+}
+previous_value = {
+    "ACC": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "GYRO": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "MAG": {"x": 0.0, "y": 0.0, "z": 0.0},  # สำหรับโหมด prev
+}
+last_active_time = {"ACC": time.time(), "GYRO": time.time(), "MAG": time.time()}
+
+# เก็บค่าดิบ ACC/MAG เพื่อคำนวณ heading ทุกครั้งที่เขียน CSV
+raw_values = {
+    "ACC": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "MAG": {"x": 0.0, "y": 0.0, "z": 0.0},
+}
+
+# ส่งขึ้นหน้าจอแบบเรียลไทม์
+latest_heading_deg = None
+latest_heading_dir = ""
+
+# -------------------- MAG Baseline & Modes --------------------
+MAG_baseline = {"x": 1.0, "y": 1.0, "z": 1.0}
+RELATIVE_MODE_MAG = 'x0'  # 'x0' หรือ 'prev' หรือ 'prev5'
+MAG_EPS = 1e-6
+# (เพิ่ม) ประวัติ MAG ต่อแกน สำหรับอ้างอิง Xi-5
+mag_history = {
+    "x": deque(maxlen=256),
+    "y": deque(maxlen=256),
+    "z": deque(maxlen=256),
+}
+
+# -------------------- Recording State --------------------
+is_recording = False
+record_lock = threading.Lock()
+csv_queue = queue.Queue(maxsize=1000)
+csv_thread = None
+current_raw_file = None
+current_resampled_file = None
+current_5s_resampled_file = None
+current_10s_resampled_file = None
+resample_lock = threading.Lock()
+current_activity = None
+log_buffer = deque(maxlen=50)
+log_counter = 0
+
+# =======================================================
+# Routes
+# =======================================================
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/download/raw/<activity>/<filename>")
+def download_raw_file(activity, filename):
+    file_path = os.path.join(BASE_DATA_DIR, activity, filename)
+    if not os.path.exists(file_path):
+        return f"Raw file not found: {file_path}", 404
+    with open(file_path, 'rb') as f:
+        return Response(f.read(), mimetype='text/csv', headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+@app.route("/download/resampled/<activity>/<filename>")
+def download_resampled_file(activity, filename):
+    file_path = os.path.join(BASE_DATA_DIR, activity, filename)
+    if not os.path.exists(file_path):
+        return f"Resampled file not found: {file_path}", 404
+    with open(file_path, 'rb') as f:
+        return Response(f.read(), mimetype='text/csv', headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+@app.route("/download/resampled_5s/<activity>/<filename>")
+def download_5s_resampled_file(activity, filename):
+    file_path = os.path.join(BASE_DATA_DIR, activity, filename)
+    if not os.path.exists(file_path):
+        return f"5s Resampled file not found: {file_path}", 404
+    with open(file_path, 'rb') as f:
+        return Response(f.read(), mimetype='text/csv', headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+@app.route("/download/resampled_10s/<activity>/<filename>")
+def download_10s_resampled_file(activity, filename):
+    file_path = os.path.join(BASE_DATA_DIR, activity, filename)
+    if not os.path.exists(file_path):
+        return f"10s Resampled file not found: {file_path}", 404
+    with open(file_path, 'rb') as f:
+        return Response(f.read(), mimetype='text/csv', headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+# =======================================================
+# Socket events
+# =======================================================
+@socketio.on("activity_started")
+def handle_activity_started(data):
+    global current_activity
+    current_activity = data["activity"]
+
+@socketio.on("set_mag_mode")
+def set_mag_mode(data):
+    global RELATIVE_MODE_MAG
+    mode = (data or {}).get("mode")
+    if mode not in ("x0", "prev", "prev5"):
+        socketio.emit("mag_mode_status", {"ok": False, "mode": RELATIVE_MODE_MAG, "error": "invalid mode"})
+        return
+    RELATIVE_MODE_MAG = mode
+    socketio.emit("mag_mode_status", {"ok": True, "mode": RELATIVE_MODE_MAG})
+
+@socketio.on("get_mag_mode")
+def get_mag_mode():
+    socketio.emit("mag_mode_status", {"ok": True, "mode": RELATIVE_MODE_MAG})
+
+# ---------- Helpers ----------
+def mag_ratio_crossed(ratio_value: float, threshold: float) -> bool:
+    """threshold >=1: ใช้ lower/upper จาก 1.0 | threshold <1: ใช้ |ratio-1| > threshold"""
+    if threshold >= 1.0:
+        upper = threshold
+        lower = 2.0 - threshold
+        return ratio_value > upper or ratio_value < lower
+    else:
+        return abs(ratio_value - 1.0) > threshold
+
+def heading_to_cardinal_th(deg: float) -> str:
+    dirs = [
+        "N (เหนือ)", "NNE", "NE (ตอ.เฉียงเหนือ)", "ENE", "E (ตะวันออก)", "ESE",
+        "SE (ตอ.เฉียงใต้)", "SSE", "S (ใต้)", "SSW", "SW (ตะวันตกเฉียงใต้)", "WSW",
+        "W (ตะวันตก)", "WNW", "NW (ตะวันตกเฉียงเหนือ)", "NNW"
+    ]
+    idx = int((deg + 11.25) // 22.5) % 16
+    return dirs[idx]
+
+def compute_heading_deg(raw_acc: dict, raw_mag: dict):
+    """tilt-compensated heading (0..360, 0=เหนือ)"""
+    ax, ay, az = raw_acc["x"], raw_acc["y"], raw_acc["z"]
+    mx, my, mz = raw_mag["x"], raw_mag["y"], raw_mag["z"]
+    if abs(mx) + abs(my) + abs(mz) < 1e-9:
+        return None
+    norm_a = math.sqrt(ax*ax + ay*ay + az*az)
+    if norm_a > 1e-6:
+        roll = math.atan2(ay, az)
+        pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+        mx2 = mx * math.cos(pitch) + mz * math.sin(pitch)
+        my2 = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
+        heading_rad = math.atan2(mx2, my2)
+    else:
+        heading_rad = math.atan2(mx, my)
+    deg = math.degrees(heading_rad)
+    if deg < 0:
+        deg += 360.0
+    return deg
+
+def print_all(address, *args):
+    global is_recording, baseline, previous_value, last_active_time, current_activity, log_counter
+    global latest_heading_deg, latest_heading_dir
+    current_time = time.time()
+    updated = False
+    log_counter += 1
+    if log_counter % 10 == 0:
+        log_buffer.append(f"Received OSC message: address={address}, args={args}")
+        logger.debug("\n".join(log_buffer))
+
+    def process(sensor_type, threshold):
+        nonlocal updated
+        key = address.split('/')[-1].lower()
+        if ':' in key:
+            key = key.split(':')[-1].lower()
+        try:
+            value = float(args[-1])
+        except (ValueError, TypeError):
+            return
+
+        # เก็บค่าดิบไว้คำนวณ heading
+        if sensor_type in ("ACC", "MAG") and key in ("x", "y", "z"):
+            raw_values[sensor_type][key] = value
+
+        # ACC / GYRO  -- **ไม่ใช้ baseline อีกต่อไป** (ใช้ค่าดิบโดยตรง)
+        if sensor_type in ["ACC", "GYRO"] and key in previous_value[sensor_type]:
+            delta = abs(value - previous_value[sensor_type][key])
+            previous_value[sensor_type][key] = value
+
+            # value_corrected = value (ตัด baseline ออก)
+            value_corrected = value
+
+            if abs(value_corrected) > threshold:
+                data_dict[sensor_type][key] = value_corrected
+                last_active_time[sensor_type] = current_time
+                updated = True
+            elif current_time - last_active_time[sensor_type] > RESET_TIMEOUT:
+                if data_dict[sensor_type].get(key, 0.0) != 0.0:
+                    data_dict[sensor_type][key] = 0.0
+                    updated = True
+
+        # MAG (เลือกโหมด x0 / prev / prev5)
+        elif sensor_type == "MAG":
+            # บันทึกประวัติสำหรับใช้งานโหมด prev5
+            if key in ("x", "y", "z"):
+                mag_history[key].append(value)
+
+            if RELATIVE_MODE_MAG == "prev":
+                ref = previous_value['MAG'].get(key, value)  # Xi-1
+            elif RELATIVE_MODE_MAG == "prev5":
+                # อิงค่าที่ 5 ขั้นก่อนหน้า: ถ้าเพิ่ง append ค่าปัจจุบันแล้ว index ที่ต้องการคือ -(5+1) = -6
+                hist = mag_history.get(key, deque())
+                if len(hist) > 5:
+                    ref = hist[-6]
+                else:
+                    ref = hist[0] if len(hist) > 0 else value
+            else:
+                ref = MAG_baseline.get(key, value)  # X0
+
+            denom = ref if abs(ref) > MAG_EPS else 1.0
+            ratio = value / denom
+            if mag_ratio_crossed(ratio, threshold):
+                data_dict[sensor_type][key] = ratio
+                last_active_time[sensor_type] = current_time
+                updated = True
+            elif current_time - last_active_time[sensor_type] > RESET_TIMEOUT:
+                if data_dict[sensor_type].get(key, 0.0) != 0.0:
+                    data_dict[sensor_type][key] = 0.0
+                    updated = True
+            previous_value['MAG'][key] = value
+
+        # อัปเดต heading แบบเรียลไทม์เพื่อโชว์บน UI
+        hd = compute_heading_deg(raw_values["ACC"], raw_values["MAG"])
+        if hd is not None:
+            latest_heading_deg = float(round(hd, 1))
+            latest_heading_dir = heading_to_cardinal_th(latest_heading_deg)
+            socketio.emit("heading_data", {"deg": latest_heading_deg, "dir": latest_heading_dir})
+
+    # route
+    if "ACC" in address:
+        process("ACC", ACC_THRESHOLD)
+    elif "GYRO" in address:
+        process("GYRO", GYRO_THRESHOLD)
+    elif "MAG" in address:
+        process("MAG", MAG_THRESHOLD)
+
+    if updated:
+        socketio.emit("sensor_data", data_dict)
+
+    # -------- เขียน CSV: คำนวณ heading ใหม่ทุกครั้ง เพื่อให้มีค่าทั้งองศาและชื่อทิศ --------
+    with record_lock:
+        recording = is_recording
+    if recording and updated:
+        csv_row = {}
+        for sensor in ["ACC", "GYRO", "MAG"]:
+            for axis in ["x", "y", "z"]:
+                v = data_dict.get(sensor, {}).get(axis, 0.0)
+                csv_row[f"{sensor}_{axis.upper()}"] = f"{v:.4f}"
+        hd = compute_heading_deg(raw_values["ACC"], raw_values["MAG"])
+        if hd is not None:
+            hd = float(round(hd, 1))
+            hd_dir = heading_to_cardinal_th(hd)
+            csv_row["Heading_Deg"] = f"{hd:.1f}"
+            csv_row["Heading_Dir"] = hd_dir
+            latest_heading_deg, latest_heading_dir = hd, hd_dir
+        else:
+            csv_row["Heading_Deg"] = ""
+            csv_row["Heading_Dir"] = ""
+        now = datetime.now(BANGKOK_TZ)
+        csv_row["Date"] = now.strftime('%d/%m/%Y')
+        csv_row["Time"] = now.strftime('%H:%M:%S.%f')[:-3]
+        csv_row["Activity"] = current_activity if current_activity else "unknown"
+        try:
+            csv_queue.put_nowait(csv_row)
+        except queue.Full:
+            logger.warning("CSV queue full, dropping oldest data")
+            csv_queue.get()
+            csv_queue.put_nowait(csv_row)
+
+# -------------------- CSV Writer Thread --------------------
+def csv_writer_thread():
+    fieldnames = ["Date", "Time", "Activity"] + \
+        [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + \
+        ["Heading_Deg", "Heading_Dir"]
+    batch_size = 100
+    buffer = []
+    if not os.access(os.path.dirname(current_raw_file) or '.', os.W_OK):
+        logger.error(f"No write permission for file: {current_raw_file}")
+        return
+    try:
+        # เขียนเป็น UTF-8 (BOM)
+        with open(current_raw_file, mode='w', newline='', buffering=8192, encoding='utf-8-sig') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            csv_file.flush()
+        with open(current_raw_file, mode='a', newline='', buffering=8192, encoding='utf-8-sig') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            while True:
+                row = csv_queue.get()
+                if row is None:
+                    if buffer:
+                        writer.writerows(buffer)
+                        csv_file.flush()
+                    break
+                buffer.append(row)
+                if len(buffer) >= batch_size:
+                    writer.writerows(buffer)
+                    csv_file.flush()
+                    buffer.clear()
+    except Exception as e:
+        logger.error(f"Error in csv_writer_thread: {str(e)}")
+
+# -------------------- Start / Stop Recording --------------------
+@socketio.on("start_recording")
+def start_recording(data):
+    """
+    ฟังก์ชันนี้ถูกเรียกเมื่อฝั่ง client ส่ง event "start_recording" มา
+    หน้าที่:
+      1) ตรวจสอบกิจกรรม (activity) ว่าถูกต้องหรือไม่ ("walk" หรือ "bed to toilet")
+      2) เซ็ตสถานะเริ่มอัด (is_recording = True) แบบปลอดภัยด้วย lock
+      3) ล้างคิว csv_queue (เผื่อมีหลงค้าง)
+      4) สร้างชื่อไฟล์ CSV ชุดใหม่ (raw + resampled 1s/5s/10s)
+      5) สตาร์ท thread ที่ทำหน้าที่เขียน CSV แบบ background
+    ข้อควรทราบ: ตัวแปร global หลายตัวต้องมีถูกประกาศ/กำหนดค่าไว้ก่อนหน้า
+    """
+    global is_recording, current_raw_file, current_resampled_file, current_5s_resampled_file, current_10s_resampled_file, csv_thread, current_activity
+
+    activity = data["activity"]  # ดึงค่ากิจกรรมจาก payload ที่ client ส่งมา เช่น {"activity": "walk"}
+
+    # อนุญาตเฉพาะ 2 กิจกรรมนี้เท่านั้น เพื่อคุมเส้นทางบันทึกไฟล์และการจัดหมวดหมู่
+    if activity not in ["walk", "bed to toilet"]:
+        # ส่งสถานะผิดพลาดกลับไปให้ client ทราบทันที
+        socketio.emit("recording_stopped", {"status": "error", "message": "Invalid activity"})
+        return
+
+    # ใช้ lock ป้องกัน race condition (เช่น client กดเริ่มหลายครั้งพร้อมกัน)
+    with record_lock:
+        if is_recording:
+            # ถ้ากำลังอัดอยู่แล้ว ไม่ทำอะไรซ้ำ
+            return
+        is_recording = True
+        current_activity = activity  # จดจำกิจกรรมครั้งนี้ไว้ (ใช้เติมลงไฟล์ output ด้วย)
+
+    # เคลียร์คิวก่อนเริ่ม เพื่อให้ไม่มีข้อมูลเก่าค้าง
+    while not csv_queue.empty():
+        csv_queue.get()
+
+    # แจ้งไปฝั่ง client ว่าเริ่มกิจกรรมแล้ว (ใช้เปลี่ยน UI / สถานะ)
+    socketio.emit("activity_started", {"activity": activity})
+
+    # ตั้งชื่อไฟล์โดยผูกกับ timestamp ตามเวลา Bangkok เพื่อให้ไม่ชนกันและรู้เวลาเก็บ
+    timestamp = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%d_%H-%M-%S")
+
+    # เลือกโฟลเดอร์ปลายทางตามชนิดกิจกรรม (ตัวแปร WALK_DIR / BED_DIR ต้องถูกกำหนดไว้ก่อน)
+    activity_dir = WALK_DIR if activity == "walk" else BED_DIR
+
+    # ตั้ง path ของไฟล์ดิบ (raw) และไฟล์ resampled หลายช่วงเวลา
+    current_raw_file = os.path.join(activity_dir, f"{activity}_data_{timestamp}.csv")
+    current_resampled_file = os.path.join(activity_dir, f"resampled_{activity}_data_{timestamp}.csv")
+    current_5s_resampled_file = os.path.join(activity_dir, f"resampled_5s_{activity}_data_{timestamp}.csv")
+    current_10s_resampled_file = os.path.join(activity_dir, f"resampled_10s_{activity}_data_{timestamp}.csv")
+
+    # สร้าง thread สำหรับเขียน CSV (ตัวฟังก์ชัน csv_writer_thread ต้อง implement ให้ดึงข้อมูลจาก csv_queue)
+    csv_thread = threading.Thread(target=csv_writer_thread, daemon=True)
+    csv_thread.start()
+
+
+@socketio.on("stop_recording")
+def stop_recording():
+    """
+    ฟังก์ชันนี้ถูกเรียกเมื่อ client ส่ง event "stop_recording" มา
+    หน้าที่:
+      1) เซ็ต is_recording = False เพื่อหยุดรับข้อมูลใหม่เข้าคิว
+      2) รอให้คิว csv_queue ว่าง (ค่อย ๆ ให้ thread เขียนจนหมด)
+      3) ใส่ sentinel (None) ลงคิวเป็นสัญญาณให้ thread จบงาน แล้ว join thread
+      4) ถ้ามีไฟล์ raw และมีข้อมูล → ทำขั้นตอน "Resample" เป็น 1s/5s/10s แล้วเขียนไฟล์ผลลัพธ์
+      5) ถ้าไม่มีข้อมูล → สร้างไฟล์ผลลัพธ์เปล่า (มี header) เพื่อให้ดาวน์โหลดได้ (ไม่ล่ม)
+      6) สุดท้ายส่ง event "recording_stopped" กลับพร้อมลิงก์ดาวน์โหลด
+    หมายเหตุ: ใช้ resample_lock ครอบช่วง resampling ป้องกันชนกันจาก process/resample อื่น
+    """
+    global is_recording, csv_thread, current_activity, current_raw_file, current_resampled_file, current_5s_resampled_file, current_10s_resampled_file
+
+    # ใช้ lock ป้องกันการเปลี่ยนสถานะพร้อมกันหลายที่
+    with record_lock:
+        if not is_recording:
+            # ถ้าไม่ได้อัดอยู่ก็ไม่ต้องทำอะไร
+            return
+        is_recording = False
+
+    # รอให้คิวที่ค้างอยู่ถูกเขียนลงไฟล์ให้หมดก่อน (หมุนรอแบบสั้น ๆ)
+    while not csv_queue.empty():
+        time.sleep(0.1)
+
+    # ส่งสัญญาณให้ thread ผู้เขียน CSV จบงาน (ข้อตกลง: None = sentinel)
+    csv_queue.put(None)
+
+    # รอ thread ปิดตัว (มี timeout ป้องกันค้าง)
+    if csv_thread:
+        csv_thread.join(timeout=2.0)
+
+    try:
+        # เช็คว่าไฟล์ raw มีอยู่จริงและมีขนาด > 0 ไหม (มีข้อมูลบันทึกจริง)
+        if os.path.exists(current_raw_file) and os.path.getsize(current_raw_file) > 0:
+
+            # ใช้ lock เพื่อกัน resampling ซ้อนทับจากที่อื่น
+            with resample_lock:
+                # กำหนดคอลัมน์มาตรฐานของไฟล์ผลลัพธ์ (header)
+                cols = ['Date', 'Time', 'Activity'] + \
+                    [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + \
+                    ["Heading_Deg", "Heading_Dir"]
+
+                # ------------- Resample 1 วินาที -------------
+                # เขียน header ลงไฟล์ 1s
+                with open(current_resampled_file, mode='w', newline='', encoding='utf-8-sig') as f:
+                    csv.DictWriter(f, fieldnames=cols).writeheader()
+
+                chunk_size = 1000            # อ่านทีละก้อนเพื่อประหยัดหน่วยความจำ
+                resampled_chunks = []        # เก็บชิ้นผลลัพธ์เพื่อ concat ตอนท้าย
+                enc = pick_file_encoding(current_raw_file)  # ตรวจจับ encoding ของไฟล์ดิบ (ฟังก์ชันนี้ต้องมีประกาศไว้ก่อน)
+
+                # อ่านไฟล์ raw แบบเป็น chunks; on_bad_lines='skip' ข้ามบรรทัดเสีย
+                for chunk in pd.read_csv(current_raw_file, chunksize=chunk_size, encoding=enc, engine='python', on_bad_lines='skip'):
+                    # รวม Date + Time → timestamp (ตามฟอร์แมตวัน/เดือน/ปี ชั่วโมง:นาที:วินาที.ไมโครวินาที)
+                    chunk['timestamp'] = pd.to_datetime(
+                        chunk['Date'] + ' ' + chunk['Time'],
+                        format='%d/%m/%Y %H:%M:%S.%f',
+                        errors='coerce'  # ถ้า parse ไม่ได้จะเป็น NaT แล้วจะถูกดรอป
+                    )
+                    # ตัดแถวที่ timestamp ว่าง (parse ไม่ผ่าน)
+                    chunk = chunk.dropna(subset=['timestamp'])
+
+                    # ใส่ timezone เป็น Asia/Bangkok (timestamp เดิมเป็น naive)
+                    chunk['timestamp'] = chunk['timestamp'].dt.tz_localize(BANGKOK_TZ)
+
+                    # กันข้อมูลซ้ำเวลาซ้อนทับ เลือก keep='last' เพื่อเก็บค่าสุดท้ายในเวลาเดียวกัน
+                    chunk = chunk.drop_duplicates(subset=['timestamp'], keep='last')
+
+                    # ตั้ง index เป็น timestamp เพื่อให้ใช้ .resample() ได้
+                    chunk = chunk.set_index('timestamp')
+
+                    # คอลัมน์ตัวเลขที่จะถูกนำไปคำนวณค่าเฉลี่ยตอน resample
+                    numeric_cols = [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + ["Heading_Deg"]
+
+                    # ทำ resample ราย 1 วินาที โดยใช้ค่าเฉลี่ยในช่วงนั้น
+                    # closed='right', label='left' → ช่วงเวลาจะปิดทางขวา ติดฉลากช่องทางซ้าย (มาตรฐานเวลาซีรีส์แบบหนึ่ง)
+                    resampled_numeric = (chunk[numeric_cols]
+                        .resample('1S', closed='right', label='left')
+                        .mean())
+
+                    # ฟังก์ชันช่วย: แปลงองศาเป็นทิศทาง (เช่น N/NE/… ในภาษาไทย), ถ้า NaN ให้ค่าว่าง
+                    def _dir_from_deg(d):
+                        return heading_to_cardinal_th(d) if pd.notna(d) else ""
+
+                    # สร้างซีรีส์ทิศทางจากคอลัมน์ Heading_Deg ที่ผ่าน resample แล้ว
+                    dir_series = resampled_numeric['Heading_Deg'].apply(_dir_from_deg)
+
+                    # เติม 0 ให้ค่าว่างในตัวเลข เพื่อไม่ให้มี NaN ในไฟล์เอาต์พุต
+                    resampled_numeric = resampled_numeric.fillna(0)
+
+                    # คัดลอกเป็นชิ้นงานที่จะเขียนออก
+                    resampled_chunk = resampled_numeric.copy()
+                    resampled_chunk['Heading_Dir'] = dir_series  # เพิ่มคอลัมน์ทิศทาง
+
+                    # กิจกรรม (Activity) ใช้ ffill เพื่อให้ช่วงเวลาที่ไม่มีค่า ใช้ค่าก่อนหน้ามาเติม
+                    resampled_chunk['Activity'] = (chunk['Activity']
+                        .resample('1S', closed='right', label='left')
+                        .ffill())
+
+                    # แปลง index (timestamp) กลับเป็น string แยกเป็น Date และ Time ตามฟอร์แมตที่ต้องการในไฟล์
+                    resampled_chunk['Date'] = resampled_chunk.index.strftime('%d/%m/%Y')
+                    resampled_chunk['Time'] = resampled_chunk.index.strftime('%H:%M:%S')
+
+                    # เก็บเฉพาะคอลัมน์ตามสเปค (จัดเรียง/เลือกเฉพาะ)
+                    resampled_chunks.append(resampled_chunk[cols])
+
+                # รวมทุกชิ้นเข้าด้วยกัน ถ้ามีข้อมูล
+                if resampled_chunks:
+                    resampled_df = pd.concat(resampled_chunks).reset_index()  # reset_index เพื่อให้มีคอลัมน์ 'timestamp' สำหรับ drop_duplicates
+                    # กัน timestamp ซ้ำอีกรอบ (กรณีอ่านหลาย chunk)
+                    resampled_df = resampled_df.drop_duplicates(subset='timestamp', keep='last')
+                    # เติม activity ที่ยังว่างด้วย current_activity ของการอัดครั้งนี้
+                    resampled_df['Activity'] = resampled_df['Activity'].fillna(current_activity)
+                    # เขียนต่อท้ายไฟล์ (mode='a') โดยไม่เขียน header ซ้ำ (header=False)
+                    resampled_df[cols].to_csv(current_resampled_file, mode='a', index=False, float_format='%.4f', header=False, encoding='utf-8-sig')
+                else:
+                    # ถ้าไม่มีชิ้นข้อมูลเลย สร้างไฟล์ว่างที่มี header เพื่อความสม่ำเสมอ
+                    pd.DataFrame(columns=cols).to_csv(current_resampled_file, mode='a', index=False, header=False, encoding='utf-8-sig')
+
+                # ------------- Resample 5 วินาที -------------
+                with open(current_5s_resampled_file, mode='w', newline='', encoding='utf-8-sig') as f:
+                    csv.DictWriter(f, fieldnames=cols).writeheader()
+
+                chunk_size = 1000
+                resampled_5s_chunks = []
+                enc = pick_file_encoding(current_raw_file)
+
+                for chunk in pd.read_csv(current_raw_file, chunksize=chunk_size, encoding=enc, engine='python', on_bad_lines='skip'):
+                    chunk['timestamp'] = pd.to_datetime(
+                        chunk['Date'] + ' ' + chunk['Time'],
+                        format='%d/%m/%Y %H:%M:%S.%f',
+                        errors='coerce'
+                    )
+                    chunk = chunk.dropna(subset=['timestamp'])
+                    chunk['timestamp'] = chunk['timestamp'].dt.tz_localize(BANGKOK_TZ)
+                    chunk = chunk.drop_duplicates(subset=['timestamp'], keep='last')
+                    chunk = chunk.set_index('timestamp')
+
+                    numeric_cols = [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + ["Heading_Deg"]
+
+                    resampled_numeric = (chunk[numeric_cols]
+                        .resample('5S', closed='right', label='left')
+                        .mean())
+
+                    def _dir_from_deg(d):
+                        return heading_to_cardinal_th(d) if pd.notna(d) else ""
+
+                    dir_series = resampled_numeric['Heading_Deg'].apply(_dir_from_deg)
+                    resampled_numeric = resampled_numeric.fillna(0)
+
+                    resampled_chunk = resampled_numeric.copy()
+                    resampled_chunk['Heading_Dir'] = dir_series
+                    resampled_chunk['Activity'] = (chunk['Activity']
+                        .resample('5S', closed='right', label='left')
+                        .ffill())
+                    resampled_chunk['Date'] = resampled_chunk.index.strftime('%d/%m/%Y')
+                    resampled_chunk['Time'] = resampled_chunk.index.strftime('%H:%M:%S')
+
+                    resampled_5s_chunks.append(resampled_chunk[cols])
+
+                if resampled_5s_chunks:
+                    resampled_5s_df = pd.concat(resampled_5s_chunks).reset_index()
+                    resampled_5s_df = resampled_5s_df.drop_duplicates(subset='timestamp', keep='last')
+                    resampled_5s_df['Activity'] = resampled_5s_df['Activity'].fillna(current_activity)
+                    resampled_5s_df[cols].to_csv(current_5s_resampled_file, mode='a', index=False, float_format='%.4f', header=False, encoding='utf-8-sig')
+                else:
+                    pd.DataFrame(columns=cols).to_csv(current_5s_resampled_file, mode='a', index=False, header=False, encoding='utf-8-sig')
+
+                # ------------- Resample 10 วินาที -------------
+                with open(current_10s_resampled_file, mode='w', newline='', encoding='utf-8-sig') as f:
+                    csv.DictWriter(f, fieldnames=cols).writeheader()
+
+                chunk_size = 1000
+                resampled_10s_chunks = []
+                enc = pick_file_encoding(current_raw_file)
+
+                for chunk in pd.read_csv(current_raw_file, chunksize=chunk_size, encoding=enc, engine='python', on_bad_lines='skip'):
+                    chunk['timestamp'] = pd.to_datetime(
+                        chunk['Date'] + ' ' + chunk['Time'],
+                        format='%d/%m/%Y %H:%M:%S.%f',
+                        errors='coerce'
+                    )
+                    chunk = chunk.dropna(subset=['timestamp'])
+                    chunk['timestamp'] = chunk['timestamp'].dt.tz_localize(BANGKOK_TZ)
+                    chunk = chunk.drop_duplicates(subset=['timestamp'], keep='last')
+                    chunk = chunk.set_index('timestamp')
+
+                    numeric_cols = [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + ["Heading_Deg"]
+
+                    resampled_numeric = (chunk[numeric_cols]
+                        .resample('10S', closed='right', label='left')
+                        .mean())
+
+                    def _dir_from_deg(d):
+                        return heading_to_cardinal_th(d) if pd.notna(d) else ""
+
+                    dir_series = resampled_numeric['Heading_Deg'].apply(_dir_from_deg)
+                    resampled_numeric = resampled_numeric.fillna(0)
+
+                    resampled_chunk = resampled_numeric.copy()
+                    resampled_chunk['Heading_Dir'] = dir_series
+                    resampled_chunk['Activity'] = (chunk['Activity']
+                        .resample('10S', closed='right', label='left')
+                        .ffill())
+                    resampled_chunk['Date'] = resampled_chunk.index.strftime('%d/%m/%Y')
+                    resampled_chunk['Time'] = resampled_chunk.index.strftime('%H:%M:%S')
+
+                    resampled_10s_chunks.append(resampled_chunk[cols])
+
+                if resampled_10s_chunks:
+                    resampled_10s_df = pd.concat(resampled_10s_chunks).reset_index()
+                    resampled_10s_df = resampled_10s_df.drop_duplicates(subset='timestamp', keep='last')
+                    resampled_10s_df['Activity'] = resampled_10s_df['Activity'].fillna(current_activity)
+                    resampled_10s_df[cols].to_csv(current_10s_resampled_file, mode='a', index=False, float_format='%.4f', header=False, encoding='utf-8-sig')
+                else:
+                    pd.DataFrame(columns=cols).to_csv(current_10s_resampled_file, mode='a', index=False, header=False, encoding='utf-8-sig')
+
+                # เมื่อทำทุกช่วงเวลาเสร็จแล้ว แจ้งกลับพร้อมลิงก์ดาวน์โหลดทั้ง 4 ไฟล์
+                socketio.emit("recording_stopped", {
+                    "status": "success",
+                    "download_urls": {
+                        "raw": f"/download/raw/{current_activity}/{os.path.basename(current_raw_file)}",
+                        "resampled": f"/download/resampled/{current_activity}/{os.path.basename(current_resampled_file)}",
+                        "5s_resampled": f"/download/resampled_5s/{current_activity}/{os.path.basename(current_5s_resampled_file)}",
+                        "10s_resampled": f"/download/resampled_10s/{current_activity}/{os.path.basename(current_10s_resampled_file)}"
+                    }
+                })
+
+        else:
+            # กรณีไม่มีไฟล์ raw หรือไฟล์ว่าง: สร้างไฟล์ผลลัพธ์ที่มีแต่ header ไว้ให้ดาวน์โหลดได้
+            cols = ['Date', 'Time', 'Activity'] + \
+                [f"{sensor}_{axis}" for sensor in ["ACC", "GYRO", "MAG"] for axis in ["X", "Y", "Z"]] + \
+                ["Heading_Deg", "Heading_Dir"]
+
+            pd.DataFrame(columns=cols).to_csv(current_resampled_file, mode='w', index=False, encoding='utf-8-sig')
+            pd.DataFrame(columns=cols).to_csv(current_5s_resampled_file, mode='w', index=False, encoding='utf-8-sig')
+            pd.DataFrame(columns=cols).to_csv(current_10s_resampled_file, mode='w', index=False, encoding='utf-8-sig')
+
+            socketio.emit("recording_stopped", {
+                "status": "success",
+                "download_urls": {
+                    "raw": f"/download/raw/{current_activity}/{os.path.basename(current_raw_file)}",
+                    "resampled": f"/download/resampled/{current_activity}/{os.path.basename(current_resampled_file)}",
+                    "5s_resampled": f"/download/resampled_5s/{current_activity}/{os.path.basename(current_5s_resampled_file)}",
+                    "10s_resampled": f"/download/resampled_10s/{current_activity}/{os.path.basename(current_10s_resampled_file)}"
+                }
+            })
+
+    except Exception as e:
+        # หากมีข้อผิดพลาดใด ๆ ระหว่างทาง ให้แจ้งกลับไปยัง client พร้อมข้อความ error
+        socketio.emit("recording_stopped", {"status": "error", "message": str(e)})
+
+
+# -------------------- Utility Events --------------------
+@socketio.on("clear_data")
+def clear_data():
+    for sensor in data_dict:
+        for axis in data_dict[sensor]:
+            data_dict[sensor][axis] = 0.0
+    socketio.emit("sensor_data", data_dict)
+
+@socketio.on("set_mag_baseline")
+def set_mag_baseline():
+    global MAG_baseline
+    for axis in ["x", "y", "z"]:
+        current_value = raw_values["MAG"].get(axis, 1.0)  # ใช้ "ค่าดิบ" ของ MAG
+        if current_value != 0:
+            MAG_baseline[axis] = current_value
+    socketio.emit("mag_baseline_status", MAG_baseline)
+
+# -------------------- OSC Server Thread --------------------
+def osc_server_thread():
+    dispatcher = Dispatcher()
+    dispatcher.set_default_handler(print_all)
+    server = BlockingOSCUDPServer((OSC_IP, OSC_PORT), dispatcher)
+    logger.info(f"OSC Server started at %s:%d", OSC_IP, OSC_PORT)
+    server.serve_forever()
+
+# -------------------- Main --------------------
+if __name__ == "__main__":
+    osc_thread = threading.Thread(target=osc_server_thread, daemon=True)
+    osc_thread.start()
+    socketio.run(app, host="0.0.0.0", port=5000)
