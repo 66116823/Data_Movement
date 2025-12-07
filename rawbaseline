@@ -62,14 +62,20 @@ def process_file(file_path: str):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=sensor_cols)
 
-    # baseline
-    baseline_df = df[df["elapsed"] <= BASELINE_SECONDS]
-
+    # ===== baseline แบบ resample 1Hz =====
+    baseline_df = df[df["elapsed"] <= BASELINE_SECONDS].copy()
     if baseline_df.empty:
         print("❌ ไม่พบข้อมูล baseline")
         return
 
-    baseline = baseline_df[sensor_cols].mean()
+    # สร้างคอลัมน์เวลาปัดเป็นเลขเต็มวินาที (0,1,2,...)
+    baseline_df["sec_round"] = baseline_df["elapsed"].astype(int)
+
+    # เฉลี่ยทุกวินาที
+    baseline_per_sec = baseline_df.groupby("sec_round")[sensor_cols].mean()
+
+    # ค่า baseline รวม 5 วินาที = ค่าเฉลี่ยของทุกวินาที
+    baseline = baseline_per_sec.mean()
 
     # ลบ baseline
     corrected_df = df.copy()
@@ -79,7 +85,6 @@ def process_file(file_path: str):
     # ✅ ลบคอลัมน์ที่ไม่ต้องการก่อน save
     drop_cols = [c for c in ["Heading_Deg", "Heading_Dir", "time_sec"]
                  if c in corrected_df.columns]
-
     corrected_df = corrected_df.drop(columns=drop_cols)
 
     # save
