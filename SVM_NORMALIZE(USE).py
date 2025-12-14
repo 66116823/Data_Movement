@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import shutil
 import tkinter as tk
 from tkinter import filedialog
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
@@ -26,28 +27,21 @@ def set_thai_font():
 # ==========================================
 
 def calculate_svm(df, prefix):
-    """คำนวณ SVM (Raw Magnitude)"""
     cols = [f'{prefix}_X', f'{prefix}_Y', f'{prefix}_Z']
     if all(col in df.columns for col in cols):
         svm_col = f'{prefix}_SVM'
-        # สูตร: sqrt(x^2 + y^2 + z^2)
         df[svm_col] = (df[cols[0]] ** 2 + df[cols[1]] ** 2 + df[cols[2]] ** 2) ** 0.5
         return svm_col
     return None
 
 
 def normalize_series(series):
-    """
-    Min-Max Normalization: ปรับค่าให้อยู่ในช่วง 0 ถึง 1
-    สูตร: (X - Min) / (Max - Min)
-    """
-    if series.max() == series.min():  # ป้องกันการหารด้วย 0 กรณีค่าเท่ากันหมด
+    if series.max() == series.min():
         return series.apply(lambda x: 0.0)
     return (series - series.min()) / (series.max() - series.min())
 
 
 def parse_time_column(df):
-    """แปลงเวลาในไฟล์เป็นวินาทีเริ่มที่ 0"""
     if 'Time' not in df.columns: return df.index.to_numpy()
     try:
         time_str = df['Time'].astype(str)
@@ -109,46 +103,33 @@ def format_excel_table(worksheet, min_row, max_row, min_col, max_col):
 def plot_normalized_graph(df, filename_base, header_title, time_axis):
     try:
         set_thai_font()
-        SMOOTH_WINDOW = 7  # ค่าความมนของกราฟ
+        SMOOTH_WINDOW = 7
 
         fig, axs = plt.subplots(3, 1, figsize=(12, 12))
-        # Title ระบุชัดเจนว่าเป็น Normalized
         fig.suptitle(f'Normalized SVM Analysis (0-1 Scale): {header_title}', fontsize=16, fontweight='bold')
-
-        locator = ticker.MaxNLocator(integer=True)  # ป้องกัน Error ไฟล์ยาว
+        locator = ticker.MaxNLocator(integer=True)
 
         def smooth_data(series, window):
             return series.rolling(window=window, center=True, min_periods=1).mean()
 
-        # Helper function ในการวาดแต่ละแกน
         def plot_subplot(ax, data_col, color, label_text, title_text):
             if data_col in df.columns:
-                # 1. ใช้ข้อมูล Normalized
                 data_to_plot = df[data_col]
-                # 2. ทำ Smoothing
                 smoothed = smooth_data(data_to_plot, SMOOTH_WINDOW)
-
                 ax.plot(time_axis, smoothed, color=color, label=f'Norm SVM (Smooth={SMOOTH_WINDOW})', linewidth=1.5)
-                ax.set_ylabel('Norm. Mag (0-1)')  # เปลี่ยนหน่วยเป็น 0-1
+                ax.set_ylabel('Norm. Mag (0-1)')
                 ax.set_title(title_text, fontsize=12)
                 ax.set_xlabel('Time (seconds)')
-                ax.set_ylim(-0.05, 1.05)  # ล็อคแกน Y ให้เห็น 0 ถึง 1 ชัดๆ
+                ax.set_ylim(-0.05, 1.05)
                 ax.xaxis.set_major_locator(locator)
                 ax.grid(True, linestyle='--', alpha=0.6)
                 ax.legend(loc='upper right')
 
-        # Plot ACC (Normalized)
         plot_subplot(axs[0], 'ACC_SVM_Norm', 'blue', 'ACC', 'Accelerometer: Normalized Pattern (รูปแบบความเร่ง)')
-
-        # Plot GYRO (Normalized)
         plot_subplot(axs[1], 'GYRO_SVM_Norm', 'green', 'GYRO', 'Gyroscope: Normalized Pattern (รูปแบบการหมุน)')
-
-        # Plot MAG (Normalized)
         plot_subplot(axs[2], 'MAG_SVM_Norm', 'red', 'MAG', 'Magnetometer: Normalized Pattern (รูปแบบแม่เหล็ก)')
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.96], h_pad=3.0)
-
-        # บันทึกเป็นชื่อ _norm_plot เพื่อแยกกับกราฟเก่า
         image_filename = filename_base + '_norm_plot.png'
         plt.savefig(image_filename)
         plt.close()
@@ -159,7 +140,72 @@ def plot_normalized_graph(df, filename_base, header_title, time_axis):
 
 
 # ==========================================
-# ส่วนที่ 4: Logic หลัก (Rename + Analyze)
+# ส่วนที่ 4: ฟังก์ชันจัดระเบียบไฟล์ (New Feature)
+# ==========================================
+
+def select_directory_dialog(prompt_title):
+    """เปิดหน้าต่างเลือก Folder และคืนค่า Path"""
+    print(f"\n📂 {prompt_title}")
+    print("   (หน้าต่างเลือกโฟลเดอร์กำลังเปิดอยู่...)")
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    folder_selected = filedialog.askdirectory(title=prompt_title)
+    if folder_selected:
+        print(f"   ✅ เลือก: {folder_selected}")
+    else:
+        print("   ❌ ไม่ได้เลือกโฟลเดอร์ (ข้ามการย้าย)")
+    return folder_selected
+
+
+def organize_output_files(source_dir, generated_files):
+    """
+    ย้ายไฟล์ผลลัพธ์ไปยังโฟลเดอร์ปลายทาง
+    generated_files: list ของ tuple (file_path, file_type)
+    file_type: 'excel' หรือ 'plot'
+    """
+    if not generated_files:
+        return
+
+    print("\n" + "=" * 60)
+    print("   🧹 ขั้นตอนการจัดเก็บไฟล์ (Organize Output)")
+    print("=" * 60)
+
+    # 1. จัดการไฟล์ Excel (_summary.xlsx)
+    excel_files = [f for f, t in generated_files if t == 'excel']
+    if excel_files:
+        print(f"\n1️⃣  พบไฟล์ Excel สรุปผลจำนวน {len(excel_files)} ไฟล์")
+        dest_excel = select_directory_dialog("เลือกโฟลเดอร์เก็บไฟล์ Excel (_summary.xlsx)")
+
+        if dest_excel:
+            print("   กำลังย้ายไฟล์ Excel...")
+            for f_path in excel_files:
+                try:
+                    shutil.move(f_path, os.path.join(dest_excel, os.path.basename(f_path)))
+                    print(f"    - ย้าย: {os.path.basename(f_path)}")
+                except Exception as e:
+                    print(f"    ❌ ย้ายไม่ได้: {os.path.basename(f_path)} ({e})")
+
+    # 2. จัดการไฟล์รูปภาพ (_norm_plot.png)
+    plot_files = [f for f, t in generated_files if t == 'plot']
+    if plot_files:
+        print(f"\n2️⃣  พบไฟล์กราฟรูปภาพจำนวน {len(plot_files)} ไฟล์")
+        dest_plot = select_directory_dialog("เลือกโฟลเดอร์เก็บไฟล์รูปภาพ (_norm_plot.png)")
+
+        if dest_plot:
+            print("   กำลังย้ายไฟล์รูปภาพ...")
+            for f_path in plot_files:
+                try:
+                    shutil.move(f_path, os.path.join(dest_plot, os.path.basename(f_path)))
+                    print(f"    - ย้าย: {os.path.basename(f_path)}")
+                except Exception as e:
+                    print(f"    ❌ ย้ายไม่ได้: {os.path.basename(f_path)} ({e})")
+
+    print("\n✅ เสร็จสิ้นขั้นตอนการจัดเก็บไฟล์")
+
+
+# ==========================================
+# ส่วนที่ 5: Logic หลัก
 # ==========================================
 
 def batch_rename_mode():
@@ -205,21 +251,21 @@ def get_experiment_info():
 def process_sensor_file(file_path, header_title, current_idx, total_files):
     filename = os.path.basename(file_path)
     print(f"\n[{current_idx}/{total_files}] 📄 กำลังประมวลผล: {filename}")
+
+    generated_output = []  # เก็บรายชื่อไฟล์ที่สร้างขึ้นเพื่อส่งไปย้ายทีหลัง
+
     try:
         df = pd.read_csv(file_path)
         elapsed_time = parse_time_column(df)
 
-        # 1. คำนวณ Raw SVM และ 2. สร้าง Normalized SVM Column
         svm_cols = []
         for sensor in ['ACC', 'GYRO', 'MAG']:
-            raw_col = calculate_svm(df, sensor)  # ได้ ACC_SVM
+            raw_col = calculate_svm(df, sensor)
             if raw_col:
                 svm_cols.append(raw_col)
-                # สร้างคอลัมน์ใหม่ เช่น ACC_SVM_Norm
                 norm_col = f'{raw_col}_Norm'
                 df[norm_col] = normalize_series(df[raw_col])
 
-        # เลือกคอลัมน์ที่จะคำนวณสถิติ (เอาเฉพาะค่าจริง ไม่เอา Norm เพราะดูยากในตาราง)
         target_stats_cols = [
             'ACC_X', 'ACC_Y', 'ACC_Z', 'ACC_SVM',
             'GYRO_X', 'GYRO_Y', 'GYRO_Z', 'GYRO_SVM',
@@ -229,9 +275,8 @@ def process_sensor_file(file_path, header_title, current_idx, total_files):
 
         if not valid_stats_cols:
             print("   ❌ ไม่พบคอลัมน์ข้อมูล")
-            return
+            return []
 
-        # คำนวณสถิติ (Mean, Max, Min ของค่าจริง หน่วย g/deg)
         stats_data = {}
         for col in valid_stats_cols:
             series = pd.to_numeric(df[col], errors='coerce')
@@ -242,17 +287,14 @@ def process_sensor_file(file_path, header_title, current_idx, total_files):
             }
         summary_df = pd.DataFrame(stats_data)
 
-        # บันทึก Excel
         base_filename_full = os.path.splitext(file_path)[0] + '_summary.xlsx'
         final_excel_filename = get_unique_filename(base_filename_full)
         final_base_name = os.path.splitext(final_excel_filename)[0]
 
         start_row = 3
         with pd.ExcelWriter(final_excel_filename, engine='openpyxl') as writer:
-            # Save Raw Data รวมคอลัมน์ Norm ไปด้วยเผื่ออยากดู
             df.to_excel(writer, sheet_name='Raw Data', index=False)
             summary_df.to_excel(writer, sheet_name='Summary Stats', startrow=start_row - 1)
-
             ws = writer.sheets['Summary Stats']
             ws['A1'] = "การทดลอง:";
             ws['B1'] = header_title
@@ -260,18 +302,22 @@ def process_sensor_file(file_path, header_title, current_idx, total_files):
             ws['B1'].font = Font(bold=True, size=12)
             ws['D1'] = "Graph Type: Normalized (0-1)";
             ws['D1'].font = Font(italic=True, color="555555")
-
             max_r = start_row + summary_df.shape[0];
             max_c = summary_df.shape[1] + 1
             format_excel_table(ws, min_row=start_row, max_row=max_r, min_col=1, max_col=max_c)
-        print(f"   ✔ Excel (Stats from Raw Data): {os.path.basename(final_excel_filename)}")
 
-        # วาดกราฟ (ใช้ข้อมูล Normalized)
+        print(f"   ✔ Excel Created: {os.path.basename(final_excel_filename)}")
+        generated_output.append((final_excel_filename, 'excel'))  # เก็บเข้า List
+
         image_file = plot_normalized_graph(df, final_base_name, header_title, elapsed_time)
-        if image_file: print(f"   ✔ Graph (Normalized 0-1): {os.path.basename(image_file)}")
+        if image_file:
+            print(f"   ✔ Graph Created: {os.path.basename(image_file)}")
+            generated_output.append((image_file, 'plot'))  # เก็บเข้า List
 
     except Exception as e:
         print(f"   ❌ Error: {e}")
+
+    return generated_output
 
 
 def analyze_data_mode():
@@ -279,19 +325,40 @@ def analyze_data_mode():
     root = tk.Tk();
     root.withdraw();
     root.attributes('-topmost', True)
+
+    print("\n⏳ กรุณาเลือกไฟล์ CSV ที่ต้องการวิเคราะห์ (เลือกได้หลายไฟล์)...")
     paths = filedialog.askopenfilenames(title="เลือกไฟล์ CSV", filetypes=[("CSV Files", "*.csv")])
+
     if paths:
         print(f"\n📦 เลือก {len(paths)} ไฟล์")
-        for i, p in enumerate(paths, 1): process_sensor_file(p, title, i, len(paths))
-        print("\n🎉 เสร็จสมบูรณ์!");
-        input("กด Enter กลับเมนู...")
+
+        all_generated_files = []  # เก็บรวมทุกไฟล์ที่สร้างจากทุก loop
+
+        # 1. Loop ประมวลผล
+        for i, p in enumerate(paths, 1):
+            output_files = process_sensor_file(p, title, i, len(paths))
+            all_generated_files.extend(output_files)
+
+        print("\n" + "=" * 50)
+        print("🎉 ประมวลผลข้อมูลเสร็จสมบูรณ์!")
+        print("=" * 50)
+
+        # 2. เข้าสู่โหมดย้ายไฟล์ (Organize)
+        if all_generated_files:
+            # หา source directory จากไฟล์แรกที่เลือก (สมมติว่าไฟล์ output อยู่ที่เดียวกับ input)
+            source_dir = os.path.dirname(paths[0])
+            organize_output_files(source_dir, all_generated_files)
+
+        input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+    else:
+        print("❌ ไม่ได้เลือกไฟล์")
 
 
 if __name__ == "__main__":
     while True:
         print("\n=== Sensor Analysis (Normalized SVM) ===")
         print(" [1] เปลี่ยนชื่อไฟล์ (Batch Rename)")
-        print(" [2] วิเคราะห์ข้อมูล (Normalize + Plot)")
+        print(" [2] วิเคราะห์ข้อมูล (Normalize + Plot + Organize)")
         print(" [0] ออก")
         c = input("เลือก: ").strip()
         if c == '1':
