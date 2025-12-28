@@ -89,4 +89,5 @@ def load_data(root_dir, window_size=128, step_size=64):
     print(f"🎯 y Shape (Labels):   {y_final.shape}")  # (Samples,)
     print("-" * 50)
 
+
     return X_final, y_final
